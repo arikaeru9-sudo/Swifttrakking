@@ -1,0 +1,116 @@
+import SwiftUI
+import ARKit
+
+class AbsoluteGazeTracker: NSObject, ObservableObject, ARSCNViewDelegate {
+    @Published var pointerPosition: CGPoint = .init(x: UIScreen.main.bounds.width / 2, y: UIScreen.main.bounds.height / 2)
+    @Published var touchPosition: CGPoint = .zero
+    @Published var isTouching: Bool = false
+    @Published var errorDistance: CGFloat = 0
+    
+    var screenSize: CGSize = UIScreen.main.bounds.size
+    var sceneView: ARSCNView = ARSCNView()
+    var initialY: Float? = nil
+    
+    override init() {
+        super.init()
+        setupAR()
+    }
+    
+    func setupAR() {
+        guard ARFaceTrackingConfiguration.isSupported else { return }
+        let config = ARFaceTrackingConfiguration()
+        sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+        sceneView.delegate = self
+    }
+    
+    func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
+        guard let faceAnchor = anchor as? ARFaceAnchor else { return }
+        
+        let faceMatrix = node.simdTransform
+        
+        // --- 目の感度を調整するためのロジック ---
+        // ARKitのlookAtPoint（顔に対する相対）
+        let lookAtLocalRaw = faceAnchor.lookAtPoint
+        
+        // ★ここで「目の動き」だけにブレーキをかける (0.5 = 半分に抑制)
+        let dampenedEyeX = lookAtLocalRaw.x * 0.45
+        let dampenedEyeY = lookAtLocalRaw.y * 0.5
+        
+        let lookAtLocal = simd_float4(dampenedEyeX, dampenedEyeY, lookAtLocalRaw.z, 1)
+        let lookAtWorld = simd_mul(faceMatrix, lookAtLocal)
+        
+        if initialY == nil {
+            initialY = lookAtWorld.y
+        }
+        
+        DispatchQueue.main.async {
+            // 基準からのズレ
+            let deltaX = CGFloat(lookAtWorld.x)
+            let deltaY = CGFloat(lookAtWorld.y - (self.initialY ?? 0))
+            
+            // 全体の感度調整
+            let sensitivityX: CGFloat = 3500
+            let sensitivityY: CGFloat = 4500
+            
+            let centerX = self.screenSize.width / 2
+            let centerY = self.screenSize.height / 2
+            
+            let targetX = centerX + (deltaX * sensitivityX)
+            let targetY = centerY - (deltaY * sensitivityY)
+            
+            // スムージングを少し重くして安定感を出す (0.2 -> 0.15)
+            let smoothing: CGFloat = 0.15
+            let finalX = max(0, min(self.screenSize.width, targetX))
+            let finalY = max(0, min(self.screenSize.height, targetY))
+            
+            self.pointerPosition.x += (finalX - self.pointerPosition.x) * smoothing
+            self.pointerPosition.y += (finalY - self.pointerPosition.y) * smoothing
+            
+            if self.isTouching {
+                let dx = self.pointerPosition.x - self.touchPosition.x
+                let dy = self.pointerPosition.y - self.touchPosition.y
+                self.errorDistance = sqrt(dx*dx + dy*dy)
+            }
+        }
+    }
+}
+
+// UI部分は変更なし
+struct ContentView: View {
+    @StateObject var tracker = AbsoluteGazeTracker()
+    var body: some View {
+        ZStack {
+            ARViewContainer(sceneView: tracker.sceneView).opacity(0.01).edgesIgnoringSafeArea(.all)
+            Color.black.edgesIgnoringSafeArea(.all)
+            
+            VStack {
+                if tracker.isTouching {
+                    Text("誤差: \(Int(tracker.errorDistance)) px")
+                        .font(.system(size: 45, weight: .black, design: .monospaced))
+                        .foregroundColor(tracker.errorDistance < 100 ? .green : .orange)
+                } else {
+                    Text("安定モード：頭の動きを主軸に追従します").foregroundColor(.gray).padding(.top, 60)
+                }
+                Spacer()
+            }
+            
+            ZStack {
+                Circle().stroke(Color.green.opacity(0.5), lineWidth: 1).frame(width: 80, height: 80)
+                Circle().stroke(Color.green, lineWidth: 2).frame(width: 25, height: 25)
+                Circle().fill(Color.green).frame(width: 4, height: 4)
+            }
+            .position(tracker.pointerPosition)
+            
+            if tracker.isTouching {
+                Circle().fill(Color.white.opacity(0.15)).frame(width: 80, height: 80).position(tracker.touchPosition)
+            }
+        }
+        .gesture(DragGesture(minimumDistance: 0).onChanged { v in tracker.touchPosition = v.location; tracker.isTouching = true }.onEnded { _ in tracker.isTouching = false })
+    }
+}
+
+struct ARViewContainer: UIViewRepresentable {
+    let sceneView: ARSCNView
+    func makeUIView(context: Context) -> ARSCNView { sceneView }
+    func updateUIView(_ uiView: ARSCNView, context: Context) {}
+}
